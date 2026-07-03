@@ -1,0 +1,19 @@
+# Build output (includes fetched Dear ImGui and compiled binaries)
+/build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# FFmpeg two-pass logs / stray artifacts
+*.log
+*.stats
+*.stats.cutree
+*.mbtree
+
+# Editor / OS cruft
+.vs/
+.vscode/
+*.user
+Thumbs.db
