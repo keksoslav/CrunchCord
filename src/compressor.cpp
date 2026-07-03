@@ -58,14 +58,16 @@ static std::wstring ext_lower(const std::wstring& p) {
     return e;
 }
 
-bool is_supported_media(const std::wstring& path) {
-    std::wstring e = ext_lower(path);
-    static const wchar_t* exts[] = {
+std::vector<std::wstring> supported_extensions() {
+    return {
         L"jpg", L"jpeg", L"png", L"bmp", L"tif", L"tiff", L"gif", L"webp", L"apng",
         L"mp4", L"mov", L"mkv", L"avi", L"webm", L"m4v", L"flv", L"wmv", L"mpg",
         L"mpeg", L"ts", L"m2ts", L"mts", L"3gp", L"ogv", L"vob", L"m2v", L"divx"
     };
-    for (auto x : exts) if (e == x) return true;
+}
+bool is_supported_media(const std::wstring& path) {
+    std::wstring e = ext_lower(path);
+    for (auto& x : supported_extensions()) if (e == x) return true;
     return false;
 }
 

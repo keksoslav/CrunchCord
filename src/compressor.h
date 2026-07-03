@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <functional>
 #include <atomic>
 #include <cstdint>
@@ -71,3 +72,4 @@ uint64_t file_size_of(const std::wstring& path);
 std::string wide_to_utf8(const std::wstring& w);
 std::wstring utf8_to_wide(const std::string& s);
 bool is_supported_media(const std::wstring& path); // recognised by extension
+std::vector<std::wstring> supported_extensions();  // e.g. "mp4", "png" (no dot)

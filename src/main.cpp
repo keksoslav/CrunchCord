@@ -23,6 +23,7 @@
 #include "process.h"
 #include "dialogs.h"
 #include "clipboard.h"
+#include "shellreg.h"
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -61,6 +62,21 @@ static void enqueue_paths(const std::vector<std::wstring>& paths) {
     if (paths.empty()) return;
     std::lock_guard<std::mutex> lk(g_incoming_mtx);
     for (auto& p : paths) g_incoming.push_back(p);
+}
+
+// Expand any folders to their media files, drop unsupported files, then enqueue.
+static void add_paths_expanding(const std::vector<std::wstring>& in) {
+    std::vector<std::wstring> out;
+    for (auto& path : in) {
+        DWORD attr = GetFileAttributesW(path.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            auto media = dlg::enum_media(path, true);
+            out.insert(out.end(), media.begin(), media.end());
+        } else if (is_supported_media(path)) {
+            out.push_back(path);
+        }
+    }
+    enqueue_paths(out);
 }
 
 static void set_stage(Job* j, const std::string& s)  { std::lock_guard<std::mutex> lk(g_ui_mtx); j->stage = s; }
@@ -275,6 +291,15 @@ static void render_ui() {
         ImGui::SetNextItemWidth(150); ImGui::Combo("##fps", &fps_idx, fpss, IM_ARRAYSIZE(fpss));
         ImGui::SameLine(); const char* auds[] = {"Auto audio", "128 kbps", "96 kbps", "64 kbps"};
         ImGui::SetNextItemWidth(150); ImGui::Combo("##aud", &audio_idx, auds, IM_ARRAYSIZE(auds));
+
+        static int reg_installed = -1;
+        if (reg_installed < 0) reg_installed = shellreg::is_installed() ? 1 : 0;
+        bool reg_on = (reg_installed == 1);
+        if (ImGui::Checkbox("Add 'Compress for Discord' to the Explorer right-click menu", &reg_on)) {
+            wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            if (reg_on) shellreg::install(exe); else shellreg::uninstall();
+            reg_installed = shellreg::is_installed() ? 1 : 0;
+        }
     }
     ImGui::Separator();
 
@@ -541,19 +566,29 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             std::vector<std::wstring> paths;
             for (UINT i = 0; i < n; ++i) {
                 wchar_t p[MAX_PATH];
-                if (!DragQueryFileW(hdrop, i, p, MAX_PATH)) continue;
-                std::wstring path = p;
-                DWORD attr = GetFileAttributesW(path.c_str());
-                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                    auto media = dlg::enum_media(path, true); // dropped folder imports all
-                    paths.insert(paths.end(), media.begin(), media.end());
-                } else if (is_supported_media(path)) {
-                    paths.push_back(path);
-                }
+                if (DragQueryFileW(hdrop, i, p, MAX_PATH)) paths.emplace_back(p);
             }
             DragFinish(hdrop);
-            enqueue_paths(paths);
+            add_paths_expanding(paths);
             return 0;
+        }
+        case WM_COPYDATA: {
+            // Another instance (launched from the right-click menu) forwarded paths.
+            COPYDATASTRUCT* cds = (COPYDATASTRUCT*)lParam;
+            if (cds && cds->lpData && cds->cbData >= sizeof(wchar_t)) {
+                std::wstring blob((const wchar_t*)cds->lpData, cds->cbData / sizeof(wchar_t));
+                std::vector<std::wstring> paths;
+                size_t start = 0, pos;
+                while ((pos = blob.find(L'\n', start)) != std::wstring::npos) {
+                    if (pos > start) paths.push_back(blob.substr(start, pos - start));
+                    start = pos + 1;
+                }
+                if (start < blob.size()) paths.push_back(blob.substr(start));
+                add_paths_expanding(paths);
+            }
+            ::ShowWindow(hWnd, SW_RESTORE);
+            ::SetForegroundWindow(hWnd);
+            return TRUE;
         }
         case WM_SYSCOMMAND:
             if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
@@ -566,6 +601,41 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 int main(int, char**) {
+    // File paths passed on the command line (Explorer verb, or "Open with").
+    std::vector<std::wstring> cli_paths;
+    {
+        int n = 0;
+        LPWSTR* a = CommandLineToArgvW(GetCommandLineW(), &n);
+        if (a) { for (int i = 1; i < n; ++i) cli_paths.emplace_back(a[i]); LocalFree(a); }
+    }
+
+    // Single instance: if one is already running, forward our paths to it and exit
+    // so right-clicking files always lands them in one window.
+    HANDLE inst_mutex = CreateMutexW(nullptr, TRUE, L"CrunchCord_SingleInstance_v1");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND other = nullptr;
+        for (int i = 0; i < 40 && !other; ++i) { // primary may still be starting up
+            other = FindWindowW(L"CrunchCordWnd", nullptr);
+            if (!other) Sleep(50);
+        }
+        if (other) {
+            if (!cli_paths.empty()) {
+                std::wstring blob;
+                for (size_t i = 0; i < cli_paths.size(); ++i) { if (i) blob += L'\n'; blob += cli_paths[i]; }
+                COPYDATASTRUCT cds{};
+                cds.dwData = 1;
+                cds.cbData = (DWORD)(blob.size() * sizeof(wchar_t));
+                cds.lpData = (void*)blob.data();
+                ::AllowSetForegroundWindow(ASFW_ANY);
+                ::SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cds);
+            }
+            ::ShowWindow(other, SW_RESTORE);
+            ::SetForegroundWindow(other);
+        }
+        if (inst_mutex) CloseHandle(inst_mutex);
+        return 0;
+    }
+
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     clip::init();
     std::thread(intake_run).detach();
@@ -588,6 +658,7 @@ int main(int, char**) {
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
     ::UpdateWindow(hwnd);
     ::DragAcceptFiles(hwnd, TRUE);
+    if (!cli_paths.empty()) add_paths_expanding(cli_paths);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -644,5 +715,6 @@ int main(int, char**) {
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
     clip::shutdown();
     CoUninitialize();
+    if (inst_mutex) CloseHandle(inst_mutex);
     return 0;
 }

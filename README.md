@@ -27,6 +27,10 @@ overshooting and making you guess export settings by hand.
 - When a job finishes, the file can go **straight to your clipboard** (either
   automatically, or with the Copy button) so you paste it into Discord with
   Ctrl+V, no hunting for the file.
+- Optional **Explorer right-click menu**: turn on "Add 'Compress for Discord' to
+  the right-click menu" in the Advanced panel, then right-click any media file
+  (or several at once) and pick **Compress for Discord** to send them straight
+  to CrunchCord. It installs per-user, so no administrator rights are needed.
 
 ## Speed
 
