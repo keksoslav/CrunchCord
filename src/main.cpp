@@ -262,6 +262,20 @@ static void render_ui() {
         if (ImGui::Button("Browse...")) browse_out_clicked = true;
     }
 
+    // ---- explorer right-click integration (visible, not buried in Advanced) ----
+    {
+        static int reg_installed = -1;
+        if (reg_installed < 0) reg_installed = shellreg::is_installed() ? 1 : 0;
+        bool reg_on = (reg_installed == 1);
+        if (ImGui::Checkbox("Add 'Compress for Discord' to the Explorer right-click menu", &reg_on)) {
+            wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            if (reg_on) shellreg::install(exe); else shellreg::uninstall();
+            reg_installed = shellreg::is_installed() ? 1 : 0;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Windows 11: right-click then 'Show more options', or Shift+right-click)");
+    }
+
     // ---- advanced ----
     static int codec_idx = 0, speed_idx = 1, maxres_idx = 0, fps_idx = 0, audio_idx = 0;
     static bool use_gpu = true;
@@ -291,15 +305,6 @@ static void render_ui() {
         ImGui::SetNextItemWidth(150); ImGui::Combo("##fps", &fps_idx, fpss, IM_ARRAYSIZE(fpss));
         ImGui::SameLine(); const char* auds[] = {"Auto audio", "128 kbps", "96 kbps", "64 kbps"};
         ImGui::SetNextItemWidth(150); ImGui::Combo("##aud", &audio_idx, auds, IM_ARRAYSIZE(auds));
-
-        static int reg_installed = -1;
-        if (reg_installed < 0) reg_installed = shellreg::is_installed() ? 1 : 0;
-        bool reg_on = (reg_installed == 1);
-        if (ImGui::Checkbox("Add 'Compress for Discord' to the Explorer right-click menu", &reg_on)) {
-            wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            if (reg_on) shellreg::install(exe); else shellreg::uninstall();
-            reg_installed = shellreg::is_installed() ? 1 : 0;
-        }
     }
     ImGui::Separator();
 
