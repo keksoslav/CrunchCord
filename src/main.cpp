@@ -22,6 +22,7 @@
 #include "compressor.h"
 #include "process.h"
 #include "dialogs.h"
+#include "clipboard.h"
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -39,6 +40,7 @@ struct Job {
     std::string           result_msg;  // guarded by g_ui_mtx
     std::wstring          out_path;
     uint64_t              out_size = 0;
+    bool                  copied = false; // guarded by g_ui_mtx (auto-copy bookkeeping)
 };
 
 static std::vector<std::unique_ptr<Job>> g_jobs;
@@ -185,6 +187,9 @@ static void render_ui() {
                              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings;
     ImGui::Begin("##main", nullptr, flags);
 
+    static double copy_msg_until = 0.0;
+    static int    copy_msg_n = 0;
+
     ImGui::TextUnformatted("CrunchCord");
     ImGui::SameLine();
     ImGui::TextDisabled("- shrink images & videos to fit Discord's upload limit");
@@ -205,13 +210,25 @@ static void render_ui() {
     // ---- add files / folder ----
     static bool recurse_folders = false;
     bool add_files_clicked = false, add_folder_clicked = false, browse_out_clicked = false;
+    bool paste_clicked = false;
     if (ImGui::Button("Add files...")) add_files_clicked = true;
     ImGui::SameLine();
     if (ImGui::Button("Add folder...")) add_folder_clicked = true;
     ImGui::SameLine();
+    ImGui::BeginDisabled(!clip::has_pasteable());
+    if (ImGui::Button("Paste")) paste_clicked = true;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
     ImGui::Checkbox("Include subfolders", &recurse_folders);
     ImGui::SameLine();
-    ImGui::TextDisabled("(or drag & drop files or folders onto the window)");
+    ImGui::TextDisabled("(drag & drop, or Ctrl+V to paste a screenshot or files)");
+
+    // Ctrl+V pastes, unless a text field has focus.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false))
+            paste_clicked = true;
+    }
 
     // ---- output location ----
     static int out_mode = 0; // 0 = same folder as source, 1 = chosen folder
@@ -281,11 +298,18 @@ static void render_ui() {
     ImGui::BeginDisabled(running);
     if (ImGui::Button("Clear all")) clear_all = true;
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    bool copy_all_clicked = false;
+    if (ImGui::Button("Copy all outputs")) copy_all_clicked = true;
+    ImGui::SameLine();
+    static bool auto_copy = true;
+    ImGui::Checkbox("Auto-copy when done", &auto_copy);
 
     // ---- snapshot jobs under lock ----
-    struct Row { std::string name, status, inS, outS; JobState state; float progress; bool removable; Job* ptr; };
+    struct Row { std::string name, status, inS, outS; JobState state; float progress; bool removable; std::wstring out_path; Job* ptr; };
     std::vector<Row> rows;
-    uint64_t sum_in = 0, sum_out = 0; int done_cnt = 0;
+    uint64_t sum_in = 0, sum_out = 0; int done_cnt = 0, n_active = 0;
+    std::vector<std::wstring> all_done_outputs, done_uncopied;
     {
         std::lock_guard<std::mutex> lk(g_ui_mtx);
         rows.reserve(g_jobs.size());
@@ -299,13 +323,21 @@ static void render_ui() {
             r.outS = (r.state == JobState::Done) ? human_size(j->out_size) : std::string("-");
             r.status = build_status(*j, r.state);
             r.removable = (r.state != JobState::Running);
-            if (r.state == JobState::Done) { sum_in += j->in_size; sum_out += j->out_size; done_cnt++; }
+            r.out_path = j->out_path;
+            if (r.state == JobState::Running || r.state == JobState::Queued || r.state == JobState::Probing)
+                n_active++;
+            if (r.state == JobState::Done) {
+                sum_in += j->in_size; sum_out += j->out_size; done_cnt++;
+                all_done_outputs.push_back(j->out_path);
+                if (!j->copied) done_uncopied.push_back(j->out_path);
+            }
             rows.push_back(std::move(r));
         }
     }
 
     // ---- table ----
     std::vector<Job*> to_remove;
+    std::vector<std::wstring> to_copy;
     ImGui::BeginChild("list", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true);
     if (rows.empty()) {
         ImGui::Dummy(ImVec2(0, 24));
@@ -316,7 +348,7 @@ static void render_ui() {
         ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 78);
         ImGui::TableSetupColumn("Output", ImGuiTableColumnFlags_WidthFixed, 78);
         ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 0.5f);
-        ImGui::TableSetupColumn("##rm", ImGuiTableColumnFlags_WidthFixed, 28);
+        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 92);
         ImGui::TableHeadersRow();
         for (size_t i = 0; i < rows.size(); ++i) {
             Row& r = rows[i];
@@ -338,6 +370,10 @@ static void render_ui() {
                 else ImGui::TextUnformatted(r.status.c_str());
             }
             ImGui::TableNextColumn();
+            if (r.state == JobState::Done && !r.out_path.empty()) {
+                if (ImGui::SmallButton("Copy")) to_copy.push_back(r.out_path);
+                ImGui::SameLine();
+            }
             ImGui::BeginDisabled(!r.removable);
             if (ImGui::SmallButton("x")) to_remove.push_back(r.ptr);
             ImGui::EndDisabled();
@@ -348,7 +384,10 @@ static void render_ui() {
     ImGui::EndChild();
 
     // ---- footer ----
-    if (done_cnt > 0 && sum_in > 0) {
+    if (ImGui::GetTime() < copy_msg_until) {
+        ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.40f, 1),
+                           "Copied %d file(s) to clipboard. Paste into Discord with Ctrl+V.", copy_msg_n);
+    } else if (done_cnt > 0 && sum_in > 0) {
         double pct = 100.0 * (1.0 - (double)sum_out / (double)sum_in);
         ImGui::Text("%d done  -  %s to %s  (saved %.0f%%)", done_cnt,
                     human_size(sum_in).c_str(), human_size(sum_out).c_str(), pct);
@@ -376,6 +415,28 @@ static void render_ui() {
             out_dir_buf[sizeof out_dir_buf - 1] = 0;
             out_mode = 1;
         }
+    }
+
+    // clipboard: paste content in
+    if (paste_clicked) {
+        std::vector<std::wstring> keep;
+        for (auto& f : clip::paste(g_hwnd))
+            if (is_supported_media(f)) keep.push_back(f);
+        enqueue_paths(keep);
+    }
+    // clipboard: copy finished files out
+    auto do_copy = [&](const std::vector<std::wstring>& v) {
+        if (!v.empty() && clip::copy_files(g_hwnd, v)) {
+            copy_msg_until = ImGui::GetTime() + 3.0;
+            copy_msg_n = (int)v.size();
+        }
+    };
+    if (!to_copy.empty()) do_copy(to_copy);
+    if (copy_all_clicked)  do_copy(all_done_outputs);
+    if (auto_copy && n_active == 0 && !done_uncopied.empty()) {
+        do_copy(done_uncopied);
+        std::lock_guard<std::mutex> lk(g_ui_mtx);
+        for (auto& j : g_jobs) if (j->state.load() == JobState::Done) j->copied = true;
     }
 
     if (start_clicked && !g_worker_running.load()) {
@@ -480,11 +541,18 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             std::vector<std::wstring> paths;
             for (UINT i = 0; i < n; ++i) {
                 wchar_t p[MAX_PATH];
-                if (DragQueryFileW(hdrop, i, p, MAX_PATH)) paths.emplace_back(p);
+                if (!DragQueryFileW(hdrop, i, p, MAX_PATH)) continue;
+                std::wstring path = p;
+                DWORD attr = GetFileAttributesW(path.c_str());
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    auto media = dlg::enum_media(path, true); // dropped folder imports all
+                    paths.insert(paths.end(), media.begin(), media.end());
+                } else if (is_supported_media(path)) {
+                    paths.push_back(path);
+                }
             }
             DragFinish(hdrop);
-            { std::lock_guard<std::mutex> lk(g_incoming_mtx);
-              for (auto& p : paths) g_incoming.push_back(p); }
+            enqueue_paths(paths);
             return 0;
         }
         case WM_SYSCOMMAND:
@@ -499,6 +567,7 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int main(int, char**) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    clip::init();
     std::thread(intake_run).detach();
     std::thread([] { g_hw = detect_hw_caps(); g_hw_ready = true; }).detach();
 
@@ -573,6 +642,7 @@ int main(int, char**) {
     CleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    clip::shutdown();
     CoUninitialize();
     return 0;
 }

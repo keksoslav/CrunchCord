@@ -9,8 +9,9 @@ overshooting and making you guess export settings by hand.
 
 ## What it does
 
-- Add files by **drag & drop**, an **Add files** picker, or **Add folder** to
-  import everything in a folder (optionally including subfolders).
+- Add files by **drag & drop**, an **Add files** picker, **Add folder** to
+  import a whole folder (optionally including subfolders), or **paste** (Ctrl+V)
+  a screenshot or copied files straight in.
 - Pick a **target size**: Discord Free 10 MB, Nitro Basic 50 MB, Nitro 500 MB,
   or a custom value.
 - Choose where results go: next to each source file, or a folder you pick.
@@ -23,6 +24,9 @@ overshooting and making you guess export settings by hand.
 - Images are re-encoded to **WebP** with a quality search, downscaling only if
   it has to.
 - Output is named `name_discord.mp4` or `name_discord.webp`.
+- When a job finishes, the file can go **straight to your clipboard** (either
+  automatically, or with the Copy button) so you paste it into Discord with
+  Ctrl+V, no hunting for the file.
 
 ## Speed
 
