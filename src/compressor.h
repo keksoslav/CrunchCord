@@ -6,15 +6,25 @@
 
 enum class Codec { H265, AV1, H264 };
 
-// Encoder tuning. Defaults chosen for "smallest file that still looks good".
+// 0 = fastest, 1 = balanced, 2 = best quality.
+enum class Speed { Fastest, Balanced, Best };
+
+// Which NVENC encoders the current GPU + driver actually support at runtime.
+struct HwCaps {
+    bool checked = false;
+    bool hevc = false;
+    bool h264 = false;
+    bool av1  = false;
+};
+
 struct EncodeOptions {
-    Codec       codec       = Codec::H265;
-    std::string preset_x    = "medium"; // libx264 / libx265 preset
-    int         preset_svt  = 6;        // libsvtav1 preset (0 slow .. 13 fast)
-    int         max_height  = 0;        // 0 = auto ladder, else cap (e.g. 720)
-    int         fps_cap     = 0;        // 0 = keep source
-    int         audio_kbps  = 0;        // 0 = auto
-    std::wstring out_dir;               // empty = same folder as the input
+    Codec        codec        = Codec::H265;
+    Speed        speed        = Speed::Balanced;
+    bool         use_hardware = true; // use NVENC when available for the codec
+    int          max_height   = 0;    // 0 = auto ladder, else cap (e.g. 720)
+    int          fps_cap      = 0;    // 0 = keep source
+    int          audio_kbps   = 0;    // 0 = auto
+    std::wstring out_dir;             // empty = same folder as the input
 };
 
 struct MediaInfo {
@@ -41,6 +51,10 @@ struct CompressResult {
     std::string  message; // summary or error text
 };
 
+// Detect NVENC support once (runs quick test encodes) and cache the result.
+HwCaps detect_hw_caps();
+bool   hw_available_for(Codec c);
+
 MediaInfo probe_media(const std::wstring& path);
 
 // Compress `in_path` to land under `target_bytes`. Reports progress through
@@ -56,3 +70,4 @@ CompressResult compress_file(const std::wstring& in_path,
 uint64_t file_size_of(const std::wstring& path);
 std::string wide_to_utf8(const std::wstring& w);
 std::wstring utf8_to_wide(const std::string& s);
+bool is_supported_media(const std::wstring& path); // recognised by extension

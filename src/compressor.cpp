@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // String / path helpers
@@ -57,6 +58,17 @@ static std::wstring ext_lower(const std::wstring& p) {
     return e;
 }
 
+bool is_supported_media(const std::wstring& path) {
+    std::wstring e = ext_lower(path);
+    static const wchar_t* exts[] = {
+        L"jpg", L"jpeg", L"png", L"bmp", L"tif", L"tiff", L"gif", L"webp", L"apng",
+        L"mp4", L"mov", L"mkv", L"avi", L"webm", L"m4v", L"flv", L"wmv", L"mpg",
+        L"mpeg", L"ts", L"m2ts", L"mts", L"3gp", L"ogv", L"vob", L"m2v", L"divx"
+    };
+    for (auto x : exts) if (e == x) return true;
+    return false;
+}
+
 // Locate ffmpeg/ffprobe: prefer a copy next to our exe, else rely on PATH.
 static std::wstring tool_path(const wchar_t* exe_name) {
     std::wstring local = proc::exe_dir() + exe_name;
@@ -68,7 +80,6 @@ static std::wstring ffprobe() { return tool_path(L"ffprobe.exe"); }
 
 static std::wstring quote(const std::wstring& s) { return L"\"" + s + L"\""; }
 
-// Build a unique 2-pass log prefix in the temp directory.
 static std::wstring make_passlog() {
     wchar_t tmp[MAX_PATH];
     DWORD n = GetTempPathW(MAX_PATH, tmp);
@@ -76,8 +87,41 @@ static std::wstring make_passlog() {
     static long counter = 0;
     long id = InterlockedIncrement(&counter);
     std::wstringstream ss;
-    ss << dir << L"dcz_" << GetCurrentProcessId() << L"_" << id;
+    ss << dir << L"ccz_" << GetCurrentProcessId() << L"_" << id;
     return ss.str();
+}
+
+// ---------------------------------------------------------------------------
+// Hardware (NVENC) detection
+// ---------------------------------------------------------------------------
+static bool test_encoder(const std::wstring& enc) {
+    std::wstring args = L"-hide_banner -loglevel error -f lavfi "
+                        L"-i color=c=black:s=256x256:d=1 -c:v " + enc + L" -f null -";
+    auto r = proc::run_capture(ffmpeg(), args);
+    return r.launched && r.exit_code == 0;
+}
+
+static HwCaps       g_caps;
+static std::once_flag g_caps_once;
+
+HwCaps detect_hw_caps() {
+    std::call_once(g_caps_once, [] {
+        g_caps.hevc = test_encoder(L"hevc_nvenc");
+        g_caps.h264 = test_encoder(L"h264_nvenc");
+        g_caps.av1  = test_encoder(L"av1_nvenc");
+        g_caps.checked = true;
+    });
+    return g_caps;
+}
+
+bool hw_available_for(Codec c) {
+    HwCaps caps = detect_hw_caps();
+    switch (c) {
+        case Codec::H265: return caps.hevc;
+        case Codec::H264: return caps.h264;
+        case Codec::AV1:  return caps.av1;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,10 +136,8 @@ static bool is_maybe_animated_ext(const std::wstring& e) {
 }
 
 static std::string get_val(const std::string& text, const std::string& key) {
-    // Parse "key=value" lines from ffprobe default output.
     size_t pos = 0;
     while ((pos = text.find(key + "=", pos)) != std::string::npos) {
-        // ensure it's at line start
         if (pos == 0 || text[pos - 1] == '\n' || text[pos - 1] == '\r') {
             size_t start = pos + key.size() + 1;
             size_t end = text.find_first_of("\r\n", start);
@@ -136,13 +178,11 @@ MediaInfo probe_media(const std::wstring& path) {
     std::string dur = get_val(t, "duration");
     if (!dur.empty() && dur != "N/A") { try { mi.duration = std::stod(dur); } catch (...) {} }
 
-    // Audio present?
     std::wstring aargs = L"-v error -select_streams a -show_entries stream=codec_name "
                          L"-of default=noprint_wrappers=1:nokey=1 " + quote(path);
     auto ar = proc::run_capture(ffprobe(), aargs);
     mi.has_audio = ar.launched && ar.output.find_first_not_of(" \r\n\t") != std::string::npos;
 
-    // Classify image vs video.
     std::wstring e = ext_lower(path);
     long nb_frames = 0;
     try { nb_frames = std::stol(get_val(t, "nb_frames")); } catch (...) {}
@@ -158,21 +198,15 @@ MediaInfo probe_media(const std::wstring& path) {
     if (!mi.is_image) {
         if (mi.duration <= 0.0 && mi.fps > 0 && nb_frames > 1)
             mi.duration = nb_frames / mi.fps;
-        if (mi.duration <= 0.0) {
-            mi.err = "Could not determine video duration";
-            return mi;
-        }
-        if (mi.width <= 0 || mi.height <= 0) {
-            mi.err = "Could not read video dimensions";
-            return mi;
-        }
+        if (mi.duration <= 0.0) { mi.err = "Could not determine video duration"; return mi; }
+        if (mi.width <= 0 || mi.height <= 0) { mi.err = "Could not read video dimensions"; return mi; }
     }
     mi.ok = true;
     return mi;
 }
 
 // ---------------------------------------------------------------------------
-// Encoding
+// Planning
 // ---------------------------------------------------------------------------
 static int even(double v) {
     int i = (int)std::llround(v);
@@ -198,7 +232,6 @@ static Plan make_plan(const MediaInfo& mi, uint64_t target_bytes, const EncodeOp
     if (opts.fps_cap > 0 && fps > opts.fps_cap) fps = opts.fps_cap;
     p.fps_used = fps;
 
-    // Audio budget: cap around 18% of the total, clamp to sane range.
     int audio_kbps = 0;
     if (mi.has_audio) {
         if (opts.audio_kbps > 0) {
@@ -212,18 +245,15 @@ static Plan make_plan(const MediaInfo& mi, uint64_t target_bytes, const EncodeOp
     double total_kbps = usable_bits / dur / 1000.0;
     double video_kbps = total_kbps - audio_kbps;
 
-    // If starved, trim audio before giving up on video quality.
     if (video_kbps < 100 && mi.has_audio && opts.audio_kbps == 0) {
         audio_kbps = 32;
         video_kbps = total_kbps - audio_kbps;
     }
     p.low_quality_warning = video_kbps < 150;
-    if (video_kbps < 40) video_kbps = 40; // hard floor; verify loop guards size
+    if (video_kbps < 40) video_kbps = 40;
     p.audio_kbps = audio_kbps;
     p.video_kbps = (int)std::llround(video_kbps);
 
-    // Resolution ladder: keep the largest height whose bits-per-pixel clears
-    // the quality bar for the chosen codec.
     double bpp_target = opts.codec == Codec::H265 ? 0.028
                       : opts.codec == Codec::AV1  ? 0.024
                                                   : 0.050;
@@ -240,7 +270,6 @@ static Plan make_plan(const MediaInfo& mi, uint64_t target_bytes, const EncodeOp
         if (bpp >= bpp_target) { chosen_h = h; chosen_w = w; break; }
     }
     if (chosen_h == 0) {
-        // Nothing clears the bar: use the smallest sane height allowed.
         for (int i = (int)(sizeof(ladder) / sizeof(ladder[0])) - 1; i >= 0; --i) {
             if (ladder[i] <= max_h) {
                 chosen_h = ladder[i];
@@ -251,52 +280,116 @@ static Plan make_plan(const MediaInfo& mi, uint64_t target_bytes, const EncodeOp
         if (chosen_h == 0) { chosen_h = max_h; chosen_w = mi.width; }
     }
 
-    if (chosen_h >= mi.height) { // never upscale
-        p.width = mi.width; p.height = mi.height; p.scale = false;
-    } else {
-        p.width = chosen_w; p.height = chosen_h; p.scale = true;
-    }
+    if (chosen_h >= mi.height) { p.width = mi.width; p.height = mi.height; p.scale = false; }
+    else                       { p.width = chosen_w; p.height = chosen_h; p.scale = true; }
     return p;
 }
 
-static std::wstring codec_lib(Codec c) {
+// ---------------------------------------------------------------------------
+// Encoder command building
+// ---------------------------------------------------------------------------
+static std::wstring encoder_name(Codec c, bool hw) {
+    if (hw) {
+        switch (c) {
+            case Codec::H265: return L"hevc_nvenc";
+            case Codec::H264: return L"h264_nvenc";
+            case Codec::AV1:  return L"av1_nvenc";
+        }
+    }
     switch (c) {
         case Codec::H265: return L"libx265";
         case Codec::AV1:  return L"libsvtav1";
         default:          return L"libx264";
     }
+    return L"libx264";
 }
 
-// Assemble one ffmpeg pass command.
-static std::wstring build_pass(const std::wstring& in, const std::wstring& out,
-                               const Plan& p, const EncodeOptions& opts,
-                               bool has_audio, int pass, const std::wstring& passlog) {
+// Software preset for the chosen speed (numeric for SVT-AV1, named otherwise).
+static std::wstring sw_preset(Codec c, Speed s) {
+    if (c == Codec::AV1) {
+        int p = s == Speed::Fastest ? 10 : s == Speed::Balanced ? 8 : 5;
+        return std::to_wstring(p);
+    }
+    switch (s) {
+        case Speed::Fastest:  return L"veryfast";
+        case Speed::Balanced: return L"fast";
+        default:              return L"slow";
+    }
+}
+static std::wstring nv_preset(Speed s) {
+    switch (s) { case Speed::Fastest: return L"p3"; case Speed::Balanced: return L"p5"; default: return L"p7"; }
+}
+static std::wstring nv_multipass(Speed s) {
+    switch (s) { case Speed::Fastest: return L"disabled"; case Speed::Balanced: return L"qres"; default: return L"fullres"; }
+}
+
+static std::wstring build_input(const std::wstring& in, const Plan& p, const EncodeOptions& opts) {
     std::wstringstream a;
     a << L"-y -hide_banner -nostdin -progress pipe:1 -nostats -i " << quote(in) << L" ";
     if (p.scale)
         a << L"-vf scale=" << p.width << L":" << p.height << L":flags=lanczos ";
-    a << L"-c:v " << codec_lib(opts.codec) << L" -b:v " << p.video_kbps << L"k ";
-    if (opts.codec == Codec::AV1)
-        a << L"-preset " << opts.preset_svt << L" ";
-    else
-        a << L"-preset " << std::wstring(opts.preset_x.begin(), opts.preset_x.end()) << L" ";
-    a << L"-pass " << pass << L" -passlogfile " << quote(passlog) << L" ";
     if (opts.fps_cap > 0) a << L"-r " << opts.fps_cap << L" ";
+    return a.str();
+}
+static std::wstring audio_args(const Plan& p, bool has_audio) {
+    if (has_audio) return L"-c:a aac -b:a " + std::to_wstring(p.audio_kbps) + L"k -ac 2 ";
+    return L"-an ";
+}
 
+// Software two-pass (best quality).
+static std::wstring build_sw2(const std::wstring& in, const std::wstring& out, const Plan& p,
+                              const EncodeOptions& opts, bool has_audio, int pass,
+                              const std::wstring& passlog) {
+    std::wstringstream a;
+    a << build_input(in, p, opts);
+    a << L"-c:v " << encoder_name(opts.codec, false) << L" -b:v " << p.video_kbps << L"k ";
+    a << L"-preset " << sw_preset(opts.codec, opts.speed) << L" ";
+    a << L"-pass " << pass << L" -passlogfile " << quote(passlog) << L" ";
     if (pass == 1) {
         a << L"-an -f null NUL";
     } else {
-        if (has_audio)
-            a << L"-c:a aac -b:a " << p.audio_kbps << L"k -ac 2 ";
-        else
-            a << L"-an ";
+        a << audio_args(p, has_audio);
         if (opts.codec == Codec::H265) a << L"-tag:v hvc1 ";
         a << L"-movflags +faststart " << quote(out);
     }
     return a.str();
 }
 
-// Parse "out_time=HH:MM:SS.microseconds" -> seconds. Returns -1 if absent.
+// Software single-pass (capped VBR) - roughly twice as fast as two-pass.
+static std::wstring build_sw1(const std::wstring& in, const std::wstring& out, const Plan& p,
+                              const EncodeOptions& opts, bool has_audio) {
+    std::wstringstream a;
+    a << build_input(in, p, opts);
+    a << L"-c:v " << encoder_name(opts.codec, false) << L" -b:v " << p.video_kbps << L"k ";
+    a << L"-preset " << sw_preset(opts.codec, opts.speed) << L" ";
+    if (opts.codec != Codec::AV1) {
+        int maxr = (int)(p.video_kbps * 1.3);
+        int buf  = p.video_kbps * 2;
+        a << L"-maxrate " << maxr << L"k -bufsize " << buf << L"k ";
+    }
+    a << audio_args(p, has_audio);
+    if (opts.codec == Codec::H265) a << L"-tag:v hvc1 ";
+    a << L"-movflags +faststart " << quote(out);
+    return a.str();
+}
+
+// Hardware NVENC, single invocation (multipass handled on the GPU).
+static std::wstring build_hw(const std::wstring& in, const std::wstring& out, const Plan& p,
+                             const EncodeOptions& opts, bool has_audio) {
+    std::wstringstream a;
+    a << build_input(in, p, opts);
+    int maxr = (int)(p.video_kbps * 1.35);
+    int buf  = p.video_kbps * 2;
+    a << L"-c:v " << encoder_name(opts.codec, true)
+      << L" -preset " << nv_preset(opts.speed)
+      << L" -tune hq -rc vbr -multipass " << nv_multipass(opts.speed)
+      << L" -b:v " << p.video_kbps << L"k -maxrate " << maxr << L"k -bufsize " << buf << L"k ";
+    a << audio_args(p, has_audio);
+    if (opts.codec == Codec::H265) a << L"-tag:v hvc1 ";
+    a << L"-movflags +faststart " << quote(out);
+    return a.str();
+}
+
 static double parse_out_time(const std::string& line) {
     const std::string key = "out_time=";
     if (line.compare(0, key.size(), key) != 0) return -1;
@@ -318,13 +411,14 @@ static std::wstring unique_out(const std::wstring& dir, const std::wstring& stem
 }
 
 static void cleanup_passlogs(const std::wstring& passlog) {
-    // ffmpeg/x265 create a handful of files based on this prefix.
     const wchar_t* suffixes[] = {L"-0.log", L"-0.log.mbtree", L"", L".cutree",
                                  L".log", L".log.cutree", L".stats", L".stats.cutree"};
     for (auto s : suffixes) DeleteFileW((passlog + s).c_str());
 }
 
-// -------- Video --------
+// ---------------------------------------------------------------------------
+// Video
+// ---------------------------------------------------------------------------
 static CompressResult compress_video(const std::wstring& in, const MediaInfo& mi,
                                      uint64_t target_bytes, const EncodeOptions& opts,
                                      const std::function<void(const ProgressInfo&)>& on_progress,
@@ -336,13 +430,12 @@ static CompressResult compress_video(const std::wstring& in, const MediaInfo& mi
     if (!outdir.empty() && outdir.back() != L'\\' && outdir.back() != L'/') outdir += L'\\';
     CreateDirectoryW(outdir.c_str(), nullptr);
 
-    // Already fits: copy as-is, preserving original quality.
     if (in_size > 0 && in_size <= target_bytes) {
         std::wstring ext = L"." + ext_lower(in);
         std::wstring out = unique_out(outdir, stem_of(in), ext);
         if (CopyFileW(in.c_str(), out.c_str(), FALSE)) {
             res.ok = true; res.out_path = out; res.out_size = file_size_of(out);
-            res.message = "Already under the limit - copied without re-encoding.";
+            res.message = "Already under the limit, copied without re-encoding.";
             return res;
         }
     }
@@ -351,41 +444,48 @@ static CompressResult compress_video(const std::wstring& in, const MediaInfo& mi
     std::wstring out = unique_out(outdir, stem_of(in), L".mp4");
     std::wstring passlog = make_passlog();
 
-    auto report = [&](int pass, double sec, const char* stage) {
-        double frac_pass = mi.duration > 0 ? std::clamp(sec / mi.duration, 0.0, 1.0) : 0.0;
+    bool hw = opts.use_hardware && hw_available_for(opts.codec);
+    bool two_pass = (!hw && opts.speed == Speed::Best);
+    int total_stages = two_pass ? 2 : 1;
+
+    auto report = [&](int stage_idx, double sec, const char* stage) {
+        double frac = mi.duration > 0 ? std::clamp(sec / mi.duration, 0.0, 1.0) : 0.0;
         ProgressInfo pi;
-        pi.fraction = float((pass == 1 ? 0.0 : 0.5) + frac_pass * 0.5);
+        pi.fraction = float((double)stage_idx / total_stages + frac / total_stages);
         pi.stage = stage;
         on_progress(pi);
     };
 
-    const int MAX_TRIES = 3;
     std::string tail;
-    for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
-        // Pass 1 (only needed once; stats stay valid across bitrate changes).
-        if (attempt == 0) {
-            std::wstring c1 = build_pass(in, out, plan, opts, mi.has_audio, 1, passlog);
-            int rc = proc::run_streaming(ffmpeg(), c1,
-                [&](const std::string& ln) { double s = parse_out_time(ln);
-                    if (s >= 0) report(1, s, "Pass 1 of 2  -  analyzing"); },
-                cancel, &tail);
-            if (rc == -2) { res.message = "Cancelled."; cleanup_passlogs(passlog); return res; }
-            if (rc != 0) {
-                res.message = "Encoding failed (pass 1).\n" + tail;
-                cleanup_passlogs(passlog); return res;
-            }
-        }
+    bool pass1_done = false;
+    const int MAX_TRIES = 3;
 
-        // Pass 2.
-        std::wstring c2 = build_pass(in, out, plan, opts, mi.has_audio, 2, passlog);
-        int rc = proc::run_streaming(ffmpeg(), c2,
-            [&](const std::string& ln) { double s = parse_out_time(ln);
-                if (s >= 0) report(2, s, "Pass 2 of 2  -  encoding"); },
-            cancel, &tail);
-        if (rc == -2) { res.message = "Cancelled."; DeleteFileW(out.c_str()); cleanup_passlogs(passlog); return res; }
-        if (rc != 0) {
-            res.message = "Encoding failed (pass 2).\n" + tail;
-            DeleteFileW(out.c_str()); cleanup_passlogs(passlog); return res;
+    for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
+        if (two_pass) {
+            if (!pass1_done) {
+                std::wstring c1 = build_sw2(in, out, plan, opts, mi.has_audio, 1, passlog);
+                int rc = proc::run_streaming(ffmpeg(), c1, [&](const std::string& ln) {
+                    double s = parse_out_time(ln); if (s >= 0) report(0, s, "Analyzing (pass 1 of 2)"); },
+                    cancel, &tail);
+                if (rc == -2) { res.message = "Cancelled."; cleanup_passlogs(passlog); return res; }
+                if (rc != 0) { res.message = "Encoding failed (pass 1).\n" + tail; cleanup_passlogs(passlog); return res; }
+                pass1_done = true;
+            }
+            std::wstring c2 = build_sw2(in, out, plan, opts, mi.has_audio, 2, passlog);
+            int rc = proc::run_streaming(ffmpeg(), c2, [&](const std::string& ln) {
+                double s = parse_out_time(ln); if (s >= 0) report(1, s, "Encoding (pass 2 of 2)"); },
+                cancel, &tail);
+            if (rc == -2) { res.message = "Cancelled."; DeleteFileW(out.c_str()); cleanup_passlogs(passlog); return res; }
+            if (rc != 0) { res.message = "Encoding failed (pass 2).\n" + tail; DeleteFileW(out.c_str()); cleanup_passlogs(passlog); return res; }
+        } else {
+            std::wstring cmd = hw ? build_hw(in, out, plan, opts, mi.has_audio)
+                                  : build_sw1(in, out, plan, opts, mi.has_audio);
+            const char* stage = hw ? "Encoding on GPU" : "Encoding";
+            int rc = proc::run_streaming(ffmpeg(), cmd, [&](const std::string& ln) {
+                double s = parse_out_time(ln); if (s >= 0) report(0, s, stage); },
+                cancel, &tail);
+            if (rc == -2) { res.message = "Cancelled."; DeleteFileW(out.c_str()); return res; }
+            if (rc != 0) { res.message = std::string("Encoding failed.\n") + tail; DeleteFileW(out.c_str()); return res; }
         }
 
         uint64_t sz = file_size_of(out);
@@ -393,15 +493,13 @@ static CompressResult compress_video(const std::wstring& in, const MediaInfo& mi
             cleanup_passlogs(passlog);
             res.ok = true; res.out_path = out; res.out_size = sz;
             double ratio = in_size ? (double)sz / in_size * 100.0 : 0.0;
-            std::wstringstream m;
-            m << plan.width << L"x" << plan.height;
-            res.message = "Encoded at " + wide_to_utf8(m.str()) +
-                          (plan.low_quality_warning ? " (tight budget - quality reduced)" : "") +
-                          " - " + std::to_string((int)ratio) + "% of original.";
+            std::wstringstream m; m << plan.width << L"x" << plan.height;
+            res.message = std::string(hw ? "GPU encoded at " : "Encoded at ") + wide_to_utf8(m.str()) +
+                          (plan.low_quality_warning ? " (tight budget, quality reduced)" : "") +
+                          ", " + std::to_string((int)ratio) + "% of original.";
             return res;
         }
 
-        // Overshot: scale the video bitrate down and re-run pass 2 only.
         double corr = double(target_bytes) * 0.97 / double(sz);
         plan.video_kbps = std::max(40, (int)std::llround(plan.video_kbps * corr));
     }
@@ -411,7 +509,9 @@ static CompressResult compress_video(const std::wstring& in, const MediaInfo& mi
     return res;
 }
 
-// -------- Image --------
+// ---------------------------------------------------------------------------
+// Image
+// ---------------------------------------------------------------------------
 static bool encode_webp(const std::wstring& in, const std::wstring& out, int quality,
                         double scale, std::atomic<bool>& cancel) {
     std::wstringstream a;
@@ -441,17 +541,15 @@ static CompressResult compress_image(const std::wstring& in, uint64_t target_byt
         std::wstring out = unique_out(outdir, stem_of(in), L"." + e);
         if (CopyFileW(in.c_str(), out.c_str(), FALSE)) {
             res.ok = true; res.out_path = out; res.out_size = file_size_of(out);
-            res.message = "Already under the limit - copied as-is.";
+            res.message = "Already under the limit, copied as-is.";
             return res;
         }
     }
 
     std::wstring out = unique_out(outdir, stem_of(in), L".webp");
     std::wstring tmp = out + L".tmp.webp";
-
     auto tick = [&](float f, const char* s) { on_progress(ProgressInfo{f, s}); };
 
-    // Binary-search WebP quality at full resolution.
     int lo = 8, hi = 95, best_q = -1;
     for (int it = 0; it < 8 && lo <= hi; ++it) {
         if (cancel.load()) { res.message = "Cancelled."; DeleteFileW(tmp.c_str()); return res; }
@@ -465,7 +563,6 @@ static CompressResult compress_image(const std::wstring& in, uint64_t target_byt
 
     double scale = 1.0;
     if (best_q < 0) {
-        // Even the lowest quality is too big: shrink until it fits.
         for (int i = 0; i < 6 && best_q < 0; ++i) {
             if (cancel.load()) { res.message = "Cancelled."; DeleteFileW(tmp.c_str()); return res; }
             scale *= 0.75;
@@ -481,8 +578,7 @@ static CompressResult compress_image(const std::wstring& in, uint64_t target_byt
     if (!encode_webp(in, out, best_q, scale, cancel)) { res.message = "Image encode failed."; return res; }
     DeleteFileW(tmp.c_str());
     res.ok = true; res.out_path = out; res.out_size = file_size_of(out);
-    res.message = "WebP quality " + std::to_string(best_q) +
-                  (scale < 0.999 ? " (resized)" : "") + ".";
+    res.message = "WebP quality " + std::to_string(best_q) + (scale < 0.999 ? " (resized)" : "") + ".";
     return res;
 }
 

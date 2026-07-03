@@ -19,6 +19,12 @@ int wmain(int argc, wchar_t** argv) {
         else if (c == L"h264") opts.codec = Codec::H264;
         else opts.codec = Codec::H265;
     }
+    if (argc >= 5) {
+        std::wstring s = argv[4];
+        if (s == L"fastest") opts.speed = Speed::Fastest;
+        else if (s == L"best") opts.speed = Speed::Best;
+        else opts.speed = Speed::Balanced;
+    }
 
     MediaInfo mi = probe_media(path);
     printf("probe: ok=%d image=%d %dx%d dur=%.2fs fps=%.2f audio=%d codec=%s%s%s\n",

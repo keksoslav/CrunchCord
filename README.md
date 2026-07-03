@@ -1,34 +1,47 @@
 # CrunchCord
 
 A small Windows GUI tool that compresses images and videos to fit under
-Discord's upload limit — spending the whole size budget on quality instead of
-overshooting and forcing you to guess export settings by hand.
+Discord's upload limit. It spends the whole size budget on quality instead of
+overshooting and making you guess export settings by hand.
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B-17-00599C)
 
 ## What it does
 
-- **Drag & drop** any number of images or videos onto the window.
-- Pick a **target size** (Discord Free 10 MB, Nitro Basic 50 MB, Nitro 500 MB,
-  or a custom value).
-- It computes the exact bitrate that fills the budget and encodes to land
-  **just under** the limit, verifying the real output size and retrying if it
-  overshoots.
-- Videos use **two-pass** encoding (H.265 by default; AV1 / H.264 available)
-  with an automatic **resolution ladder** — if the budget is too small for the
-  source resolution it steps down (1080p → 720p → 480p …) so the remaining bits
-  look clean instead of blocky.
-- Images are re-encoded to **WebP** with a quality search (and downscale only if
-  strictly necessary).
-- Output goes next to each source file as `name_discord.mp4` / `.webp`
-  (or a folder you choose).
+- Add files by **drag & drop**, an **Add files** picker, or **Add folder** to
+  import everything in a folder (optionally including subfolders).
+- Pick a **target size**: Discord Free 10 MB, Nitro Basic 50 MB, Nitro 500 MB,
+  or a custom value.
+- Choose where results go: next to each source file, or a folder you pick.
+- It works out the exact bitrate that fills the budget, encodes to land just
+  under the limit, checks the real output size, and retries at a lower bitrate
+  if it overshot. The result is reliably under the cap.
+- An automatic **resolution ladder** steps the video down (1080p, 720p, 480p and
+  so on) when the budget is too small for the source resolution, so the bits
+  that remain look clean instead of blocky.
+- Images are re-encoded to **WebP** with a quality search, downscaling only if
+  it has to.
+- Output is named `name_discord.mp4` or `name_discord.webp`.
+
+## Speed
+
+Encoding uses your **NVIDIA GPU (NVENC)** automatically when it is available,
+which is far faster than encoding on the CPU. If no GPU encoder is available it
+falls back to the CPU, and the default "Balanced" mode uses a single fast pass
+rather than two passes. There are three speed settings in the Advanced panel:
+Fastest, Balanced, and Best quality.
+
+GPU encoding needs a reasonably recent NVIDIA driver (FFmpeg 8.x requires driver
+version 570 or newer). If the Advanced panel shows "no GPU encoder", update your
+driver and it will switch to the GPU on the next run.
 
 ## Requirements
 
 - Windows 10/11 (x64)
-- **FFmpeg** — `ffmpeg.exe` and `ffprobe.exe` must be on your `PATH`, or copied
-  next to `CrunchCord.exe`. (e.g. `winget install Gyan.FFmpeg`)
+- **FFmpeg**: `ffmpeg.exe` and `ffprobe.exe` on your `PATH`, or copied next to
+  `CrunchCord.exe`. Install with `winget install Gyan.FFmpeg`.
+- Optional: an NVIDIA GPU with driver 570+ for hardware encoding.
 
 ## Build
 
@@ -38,29 +51,28 @@ cmake --build build
 ```
 
 The executable lands at `build/CrunchCord.exe`. Dear ImGui is fetched
-automatically; the GUI uses the Win32 + DirectX 11 backend, so no other
-libraries are required beyond the Windows SDK. The MinGW build is statically
-linked, so the resulting `.exe` is standalone.
+automatically, and the GUI uses the Win32 + DirectX 11 backend, so nothing is
+required beyond the Windows SDK. The MinGW build is statically linked, so the
+resulting `.exe` runs standalone.
 
 ## How it works
 
-| Stage | What happens |
-|-------|--------------|
-| Probe | `ffprobe` reads duration, resolution, fps, audio |
-| Plan  | target bitrate = `(size × 8) / duration` − audio − 2% muxing headroom |
+| Stage  | What happens |
+|--------|--------------|
+| Probe  | `ffprobe` reads duration, resolution, fps, and audio |
+| Plan   | video bitrate = target size in bits / duration, minus audio and a 2% muxing margin |
 | Ladder | pick the largest resolution whose bits-per-pixel clears the quality bar |
-| Encode | two-pass `libx265` / `libsvtav1` / `libx264` |
-| Verify | measure real output; if over, drop bitrate and re-run pass 2 |
+| Encode | `hevc_nvenc` / `av1_nvenc` / `h264_nvenc` on the GPU, or `libx265` / `libsvtav1` / `libx264` on the CPU |
+| Verify | measure the real output; if it is over, lower the bitrate and re-run |
 
 ## Notes
 
-- H.265/AV1 make the smallest files but occasionally won't inline-preview on
-  some Discord clients (you'd click to download). Switch to **H.264** in the
-  Advanced panel for maximum compatibility.
-- Size targets are computed against a decimal MB (1,000,000 bytes) with a small
-  safety margin, so uploads stay under the limit regardless of how Discord
-  rounds.
+- H.265 and AV1 make the smallest files, but a few Discord clients will not show
+  an inline preview for them (you click to download instead). Switch to H.264 in
+  the Advanced panel for maximum compatibility.
+- Size targets use a decimal MB (1,000,000 bytes) with a small safety margin, so
+  uploads stay under the limit no matter how Discord rounds.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

@@ -1,10 +1,12 @@
-// CrunchCord — Dear ImGui (Win32 + DirectX 11) front end.
+// CrunchCord - Dear ImGui (Win32 + DirectX 11) front end.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <objbase.h>
 #include <d3d11.h>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -19,6 +21,7 @@
 
 #include "compressor.h"
 #include "process.h"
+#include "dialogs.h"
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -47,6 +50,16 @@ static std::mutex                g_incoming_mtx;
 static std::atomic<bool> g_cancel{false};
 static std::atomic<bool> g_worker_running{false};
 static std::atomic<bool> g_app_quit{false};
+
+static HWND              g_hwnd = nullptr;
+static std::atomic<bool> g_hw_ready{false};
+static HwCaps            g_hw;
+
+static void enqueue_paths(const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return;
+    std::lock_guard<std::mutex> lk(g_incoming_mtx);
+    for (auto& p : paths) g_incoming.push_back(p);
+}
 
 static void set_stage(Job* j, const std::string& s)  { std::lock_guard<std::mutex> lk(g_ui_mtx); j->stage = s; }
 static void set_result(Job* j, const std::string& s) { std::lock_guard<std::mutex> lk(g_ui_mtx); j->result_msg = s; }
@@ -177,7 +190,7 @@ static void render_ui() {
     ImGui::TextDisabled("- shrink images & videos to fit Discord's upload limit");
     ImGui::Separator();
 
-    // ---- settings ----
+    // ---- target size ----
     static int target_idx = 0; static float custom_mb = 25.f;
     const char* targets[] = {"Discord Free  -  10 MB", "Nitro Basic  -  50 MB",
                              "Nitro  -  500 MB", "Custom..."};
@@ -189,24 +202,62 @@ static void render_ui() {
         if (custom_mb < 1.f) custom_mb = 1.f;
     }
 
-    static int codec_idx = 0, speed_idx = 0, maxres_idx = 0, fps_idx = 0, audio_idx = 0;
+    // ---- add files / folder ----
+    static bool recurse_folders = false;
+    bool add_files_clicked = false, add_folder_clicked = false, browse_out_clicked = false;
+    if (ImGui::Button("Add files...")) add_files_clicked = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Add folder...")) add_folder_clicked = true;
+    ImGui::SameLine();
+    ImGui::Checkbox("Include subfolders", &recurse_folders);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(or drag & drop files or folders onto the window)");
+
+    // ---- output location ----
+    static int out_mode = 0; // 0 = same folder as source, 1 = chosen folder
     static char out_dir_buf[512] = "";
+    ImGui::TextUnformatted("Save to:");
+    ImGui::SameLine();
+    ImGui::RadioButton("Same folder as each file", &out_mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Choose a folder", &out_mode, 1);
+    if (out_mode == 1) {
+        ImGui::SetNextItemWidth(430);
+        ImGui::InputTextWithHint("##outdir", "Pick or type an output folder",
+                                 out_dir_buf, sizeof out_dir_buf);
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) browse_out_clicked = true;
+    }
+
+    // ---- advanced ----
+    static int codec_idx = 0, speed_idx = 1, maxres_idx = 0, fps_idx = 0, audio_idx = 0;
+    static bool use_gpu = true;
+    bool gpu_checked  = g_hw_ready.load();
+    bool gpu_possible = gpu_checked && (g_hw.hevc || g_hw.h264 || g_hw.av1);
     if (ImGui::CollapsingHeader("Advanced")) {
         const char* codecs[] = {"H.265 (HEVC)  -  smaller, previews on most clients",
                                 "AV1  -  smallest, slower to encode",
                                 "H.264  -  largest, plays everywhere"};
         ImGui::SetNextItemWidth(420); ImGui::Combo("Video codec", &codec_idx, codecs, IM_ARRAYSIZE(codecs));
-        const char* speeds[] = {"Balanced", "Faster (lower quality)", "Slower (best quality)"};
+
+        const char* speeds[] = {"Fastest", "Balanced", "Best quality (slower)"};
         ImGui::SetNextItemWidth(260); ImGui::Combo("Encode speed", &speed_idx, speeds, IM_ARRAYSIZE(speeds));
+
+        ImGui::BeginDisabled(!gpu_possible);
+        ImGui::Checkbox("Use GPU (NVENC) when possible", &use_gpu);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (!gpu_checked)      ImGui::TextDisabled("(checking GPU...)");
+        else if (gpu_possible) ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.40f, 1), "GPU ready");
+        else                   ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.30f, 1),
+                                                  "no GPU encoder (update NVIDIA driver to 570+)");
+
         const char* res[] = {"Auto", "Max 1080p", "Max 720p", "Max 480p"};
         ImGui::SetNextItemWidth(150); ImGui::Combo("Resolution", &maxres_idx, res, IM_ARRAYSIZE(res));
         ImGui::SameLine(); const char* fpss[] = {"Keep FPS", "Cap 60", "Cap 30"};
         ImGui::SetNextItemWidth(150); ImGui::Combo("##fps", &fps_idx, fpss, IM_ARRAYSIZE(fpss));
         ImGui::SameLine(); const char* auds[] = {"Auto audio", "128 kbps", "96 kbps", "64 kbps"};
         ImGui::SetNextItemWidth(150); ImGui::Combo("##aud", &audio_idx, auds, IM_ARRAYSIZE(auds));
-        ImGui::SetNextItemWidth(430);
-        ImGui::InputTextWithHint("Output folder", "(blank = same folder as each file)",
-                                 out_dir_buf, sizeof out_dir_buf);
     }
     ImGui::Separator();
 
@@ -230,8 +281,6 @@ static void render_ui() {
     ImGui::BeginDisabled(running);
     if (ImGui::Button("Clear all")) clear_all = true;
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("   Drag & drop files anywhere on this window");
 
     // ---- snapshot jobs under lock ----
     struct Row { std::string name, status, inS, outS; JobState state; float progress; bool removable; Job* ptr; };
@@ -309,18 +358,37 @@ static void render_ui() {
     ImGui::End();
 
     // ---- apply actions ----
+    if (add_files_clicked) {
+        std::vector<std::wstring> keep;
+        for (auto& f : dlg::open_files(g_hwnd))
+            if (is_supported_media(f)) keep.push_back(f);
+        enqueue_paths(keep);
+    }
+    if (add_folder_clicked) {
+        std::wstring folder = dlg::open_folder(g_hwnd);
+        if (!folder.empty()) enqueue_paths(dlg::enum_media(folder, recurse_folders));
+    }
+    if (browse_out_clicked) {
+        std::wstring folder = dlg::open_folder(g_hwnd);
+        if (!folder.empty()) {
+            std::string u = wide_to_utf8(folder);
+            strncpy(out_dir_buf, u.c_str(), sizeof out_dir_buf - 1);
+            out_dir_buf[sizeof out_dir_buf - 1] = 0;
+            out_mode = 1;
+        }
+    }
+
     if (start_clicked && !g_worker_running.load()) {
         g_cancel = false;
         g_worker_running = true;
         EncodeOptions opts;
         opts.codec = codec_idx == 0 ? Codec::H265 : codec_idx == 1 ? Codec::AV1 : Codec::H264;
-        if (speed_idx == 0)      { opts.preset_x = "medium";   opts.preset_svt = 6; }
-        else if (speed_idx == 1) { opts.preset_x = "veryfast"; opts.preset_svt = 9; }
-        else                     { opts.preset_x = "slow";     opts.preset_svt = 4; }
+        opts.speed = speed_idx == 0 ? Speed::Fastest : speed_idx == 1 ? Speed::Balanced : Speed::Best;
+        opts.use_hardware = use_gpu;
         opts.max_height = maxres_idx == 0 ? 0 : maxres_idx == 1 ? 1080 : maxres_idx == 2 ? 720 : 480;
         opts.fps_cap    = fps_idx == 0 ? 0 : fps_idx == 1 ? 60 : 30;
         opts.audio_kbps = audio_idx == 0 ? 0 : audio_idx == 1 ? 128 : audio_idx == 2 ? 96 : 64;
-        opts.out_dir    = out_dir_buf[0] ? utf8_to_wide(out_dir_buf) : L"";
+        opts.out_dir    = (out_mode == 1 && out_dir_buf[0]) ? utf8_to_wide(out_dir_buf) : L"";
         double mb = target_idx == 0 ? 10 : target_idx == 1 ? 50 : target_idx == 2 ? 500 : (double)custom_mb;
         uint64_t tb = (uint64_t)(mb * 1000.0 * 1000.0);
         std::thread(worker_run, opts, tb).detach();
@@ -430,15 +498,18 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 int main(int, char**) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     std::thread(intake_run).detach();
+    std::thread([] { g_hw = detect_hw_caps(); g_hw_ready = true; }).detach();
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
                        GetModuleHandle(nullptr), nullptr, ::LoadCursor(nullptr, IDC_ARROW),
                        nullptr, nullptr, L"CrunchCordWnd", nullptr };
     ::RegisterClassExW(&wc);
     HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"CrunchCord",
-                                WS_OVERLAPPEDWINDOW, 100, 100, 980, 700,
+                                WS_OVERLAPPEDWINDOW, 100, 100, 1000, 760,
                                 nullptr, nullptr, wc.hInstance, nullptr);
+    g_hwnd = hwnd;
 
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
@@ -502,5 +573,6 @@ int main(int, char**) {
     CleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    CoUninitialize();
     return 0;
 }
