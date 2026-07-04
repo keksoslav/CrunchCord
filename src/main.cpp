@@ -23,7 +23,6 @@
 #include "process.h"
 #include "dialogs.h"
 #include "clipboard.h"
-#include "shellreg.h"
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -260,20 +259,6 @@ static void render_ui() {
                                  out_dir_buf, sizeof out_dir_buf);
         ImGui::SameLine();
         if (ImGui::Button("Browse...")) browse_out_clicked = true;
-    }
-
-    // ---- explorer right-click integration (visible, not buried in Advanced) ----
-    {
-        static int reg_installed = -1;
-        if (reg_installed < 0) reg_installed = shellreg::is_installed() ? 1 : 0;
-        bool reg_on = (reg_installed == 1);
-        if (ImGui::Checkbox("Add 'Compress for Discord' to the Explorer right-click menu", &reg_on)) {
-            wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            if (reg_on) shellreg::install(exe); else shellreg::uninstall();
-            reg_installed = shellreg::is_installed() ? 1 : 0;
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(Windows 11: right-click then 'Show more options', or Shift+right-click)");
     }
 
     // ---- advanced ----

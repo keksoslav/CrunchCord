@@ -26,7 +26,6 @@ add_executable(CrunchCord
   src/process.cpp
   src/dialogs.cpp
   src/clipboard.cpp
-  src/shellreg.cpp
   ${IMGUI_DIR}/imgui.cpp
   ${IMGUI_DIR}/imgui_draw.cpp
   ${IMGUI_DIR}/imgui_tables.cpp
@@ -47,7 +46,7 @@ target_compile_definitions(CrunchCord PRIVATE
 )
 
 target_link_libraries(CrunchCord PRIVATE
-  d3d11 d3dcompiler dxgi dwmapi shell32 ole32 uuid gdiplus advapi32
+  d3d11 d3dcompiler dxgi dwmapi shell32 ole32 uuid gdiplus
 )
 
 if(MSVC)
