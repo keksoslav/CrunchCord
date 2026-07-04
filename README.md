@@ -7,6 +7,13 @@ overshooting and making you guess export settings by hand.
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B-17-00599C)
 
+## Download
+
+Prebuilt Windows (x64) builds are on the
+[Releases](https://github.com/keksoslav/CrunchCord/releases) page, published
+automatically by GitHub Actions. The exe is standalone; you only need FFmpeg on
+your PATH (see Requirements). Prefer to build it yourself? See Build below.
+
 ## What it does
 
 - Add files by **drag & drop**, an **Add files** picker, **Add folder** to
@@ -30,6 +37,10 @@ overshooting and making you guess export settings by hand.
 - You can also open files with CrunchCord directly (drag them on, or use
   Windows "Open with"), and a running window picks up files from later launches
   instead of opening a second window.
+- Your choices (target size, codec, speed, output folder, and so on) are
+  **remembered between launches**.
+- Finished videos show a small **GPU or CPU badge** so you can tell at a glance
+  which encoder ran.
 
 ## Speed
 

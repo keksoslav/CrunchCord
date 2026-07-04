@@ -46,9 +46,10 @@ struct ProgressInfo {
 };
 
 struct CompressResult {
-    bool         ok       = false;
+    bool         ok            = false;
     std::wstring out_path;
-    uint64_t     out_size = 0;
+    uint64_t     out_size      = 0;
+    bool         used_hardware = false; // true if a GPU (NVENC) encoder was used
     std::string  message; // summary or error text
 };
 

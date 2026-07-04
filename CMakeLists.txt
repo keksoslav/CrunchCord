@@ -50,7 +50,10 @@ target_link_libraries(CrunchCord PRIVATE
 )
 
 if(MSVC)
+  target_compile_definitions(CrunchCord PRIVATE _CRT_SECURE_NO_WARNINGS)
   target_compile_options(CrunchCord PRIVATE /utf-8 /W3 /EHsc)
+  # Static CRT so the released .exe runs standalone (no VC++ redistributable).
+  set_property(TARGET CrunchCord PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   # GUI subsystem (no console window) while keeping a standard int main()
   set_target_properties(CrunchCord PROPERTIES
     LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")

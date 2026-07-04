@@ -493,10 +493,11 @@ static CompressResult compress_video(const std::wstring& in, const MediaInfo& mi
         uint64_t sz = file_size_of(out);
         if (sz <= target_bytes || attempt == MAX_TRIES - 1) {
             cleanup_passlogs(passlog);
-            res.ok = true; res.out_path = out; res.out_size = sz;
+            res.ok = true; res.out_path = out; res.out_size = sz; res.used_hardware = hw;
             double ratio = in_size ? (double)sz / in_size * 100.0 : 0.0;
             std::wstringstream m; m << plan.width << L"x" << plan.height;
-            res.message = std::string(hw ? "GPU encoded at " : "Encoded at ") + wide_to_utf8(m.str()) +
+            // Encoder (GPU/CPU) is shown as a badge in the UI, so keep this concise.
+            res.message = wide_to_utf8(m.str()) +
                           (plan.low_quality_warning ? " (tight budget, quality reduced)" : "") +
                           ", " + std::to_string((int)ratio) + "% of original.";
             return res;

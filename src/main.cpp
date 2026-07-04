@@ -7,6 +7,8 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <process.h>   // _beginthreadex, needed by <thread> under MSVC
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -41,6 +43,7 @@ struct Job {
     std::wstring          out_path;
     uint64_t              out_size = 0;
     bool                  copied = false; // guarded by g_ui_mtx (auto-copy bookkeeping)
+    bool                  used_hardware = false; // GPU vs CPU (for the row badge)
 };
 
 static std::vector<std::unique_ptr<Job>> g_jobs;
@@ -56,6 +59,73 @@ static std::atomic<bool> g_app_quit{false};
 static HWND              g_hwnd = nullptr;
 static std::atomic<bool> g_hw_ready{false};
 static HwCaps            g_hw;
+
+// ---------------------------------------------------------------------------
+// Persisted settings (remembered between launches)
+// ---------------------------------------------------------------------------
+struct Settings {
+    int   target_idx = 0;
+    float custom_mb  = 25.f;
+    int   codec_idx = 0, speed_idx = 1, maxres_idx = 0, fps_idx = 0, audio_idx = 0;
+    bool  use_gpu    = true;
+    int   out_mode   = 0;
+    char  out_dir[512] = "";
+    bool  recurse_folders = false;
+    bool  auto_copy  = true;
+};
+static Settings g_settings;
+
+static std::wstring settings_path() {
+    wchar_t buf[MAX_PATH];
+    std::wstring dir = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH) ? buf : proc::exe_dir();
+    dir += L"\\CrunchCord";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\settings.ini";
+}
+
+static void save_settings() {
+    FILE* f = _wfopen(settings_path().c_str(), L"w");
+    if (!f) return;
+    fprintf(f, "target_idx=%d\n",      g_settings.target_idx);
+    fprintf(f, "custom_mb=%.0f\n",      g_settings.custom_mb);
+    fprintf(f, "codec_idx=%d\n",        g_settings.codec_idx);
+    fprintf(f, "speed_idx=%d\n",        g_settings.speed_idx);
+    fprintf(f, "maxres_idx=%d\n",       g_settings.maxres_idx);
+    fprintf(f, "fps_idx=%d\n",          g_settings.fps_idx);
+    fprintf(f, "audio_idx=%d\n",        g_settings.audio_idx);
+    fprintf(f, "use_gpu=%d\n",          g_settings.use_gpu ? 1 : 0);
+    fprintf(f, "out_mode=%d\n",         g_settings.out_mode);
+    fprintf(f, "out_dir=%s\n",          g_settings.out_dir);
+    fprintf(f, "recurse_folders=%d\n",  g_settings.recurse_folders ? 1 : 0);
+    fprintf(f, "auto_copy=%d\n",        g_settings.auto_copy ? 1 : 0);
+    fclose(f);
+}
+
+static void load_settings() {
+    FILE* f = _wfopen(settings_path().c_str(), L"r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* key = line; char* val = eq + 1;
+        char* nl = strpbrk(val, "\r\n"); if (nl) *nl = 0;
+        if      (!strcmp(key, "target_idx"))      g_settings.target_idx = atoi(val);
+        else if (!strcmp(key, "custom_mb"))       g_settings.custom_mb  = (float)atof(val);
+        else if (!strcmp(key, "codec_idx"))       g_settings.codec_idx  = atoi(val);
+        else if (!strcmp(key, "speed_idx"))       g_settings.speed_idx  = atoi(val);
+        else if (!strcmp(key, "maxres_idx"))      g_settings.maxres_idx = atoi(val);
+        else if (!strcmp(key, "fps_idx"))         g_settings.fps_idx    = atoi(val);
+        else if (!strcmp(key, "audio_idx"))       g_settings.audio_idx  = atoi(val);
+        else if (!strcmp(key, "use_gpu"))         g_settings.use_gpu    = atoi(val) != 0;
+        else if (!strcmp(key, "out_mode"))        g_settings.out_mode   = atoi(val);
+        else if (!strcmp(key, "out_dir"))       { strncpy(g_settings.out_dir, val, sizeof g_settings.out_dir - 1); g_settings.out_dir[sizeof g_settings.out_dir - 1] = 0; }
+        else if (!strcmp(key, "recurse_folders")) g_settings.recurse_folders = atoi(val) != 0;
+        else if (!strcmp(key, "auto_copy"))       g_settings.auto_copy  = atoi(val) != 0;
+    }
+    fclose(f);
+}
 
 static void enqueue_paths(const std::vector<std::wstring>& paths) {
     if (paths.empty()) return;
@@ -178,6 +248,7 @@ static void worker_run(EncodeOptions opts, uint64_t target_bytes) {
                 job->out_path = r.out_path;
                 job->out_size = r.out_size;
                 job->result_msg = r.message;
+                job->used_hardware = r.used_hardware;
             }
             job->progress = 1.f;
             job->state = JobState::Done;
@@ -205,13 +276,26 @@ static void render_ui() {
     static double copy_msg_until = 0.0;
     static int    copy_msg_n = 0;
 
+    // Bind widgets to the persisted settings so choices survive between launches.
+    int&   target_idx        = g_settings.target_idx;
+    float& custom_mb         = g_settings.custom_mb;
+    bool&  recurse_folders   = g_settings.recurse_folders;
+    int&   out_mode          = g_settings.out_mode;
+    char (&out_dir_buf)[512] = g_settings.out_dir;
+    int&   codec_idx         = g_settings.codec_idx;
+    int&   speed_idx         = g_settings.speed_idx;
+    int&   maxres_idx        = g_settings.maxres_idx;
+    int&   fps_idx           = g_settings.fps_idx;
+    int&   audio_idx         = g_settings.audio_idx;
+    bool&  use_gpu           = g_settings.use_gpu;
+    bool&  auto_copy         = g_settings.auto_copy;
+
     ImGui::TextUnformatted("CrunchCord");
     ImGui::SameLine();
     ImGui::TextDisabled("- shrink images & videos to fit Discord's upload limit");
     ImGui::Separator();
 
     // ---- target size ----
-    static int target_idx = 0; static float custom_mb = 25.f;
     const char* targets[] = {"Discord Free  -  10 MB", "Nitro Basic  -  50 MB",
                              "Nitro  -  500 MB", "Custom..."};
     ImGui::SetNextItemWidth(260);
@@ -223,7 +307,6 @@ static void render_ui() {
     }
 
     // ---- add files / folder ----
-    static bool recurse_folders = false;
     bool add_files_clicked = false, add_folder_clicked = false, browse_out_clicked = false;
     bool paste_clicked = false;
     if (ImGui::Button("Add files...")) add_files_clicked = true;
@@ -246,8 +329,6 @@ static void render_ui() {
     }
 
     // ---- output location ----
-    static int out_mode = 0; // 0 = same folder as source, 1 = chosen folder
-    static char out_dir_buf[512] = "";
     ImGui::TextUnformatted("Save to:");
     ImGui::SameLine();
     ImGui::RadioButton("Same folder as each file", &out_mode, 0);
@@ -262,8 +343,6 @@ static void render_ui() {
     }
 
     // ---- advanced ----
-    static int codec_idx = 0, speed_idx = 1, maxres_idx = 0, fps_idx = 0, audio_idx = 0;
-    static bool use_gpu = true;
     bool gpu_checked  = g_hw_ready.load();
     bool gpu_possible = gpu_checked && (g_hw.hevc || g_hw.h264 || g_hw.av1);
     if (ImGui::CollapsingHeader("Advanced")) {
@@ -317,11 +396,10 @@ static void render_ui() {
     bool copy_all_clicked = false;
     if (ImGui::Button("Copy all outputs")) copy_all_clicked = true;
     ImGui::SameLine();
-    static bool auto_copy = true;
     ImGui::Checkbox("Auto-copy when done", &auto_copy);
 
     // ---- snapshot jobs under lock ----
-    struct Row { std::string name, status, inS, outS; JobState state; float progress; bool removable; std::wstring out_path; Job* ptr; };
+    struct Row { std::string name, status, inS, outS; JobState state; float progress; bool removable; bool used_hardware; bool is_image; std::wstring out_path; Job* ptr; };
     std::vector<Row> rows;
     uint64_t sum_in = 0, sum_out = 0; int done_cnt = 0, n_active = 0;
     std::vector<std::wstring> all_done_outputs, done_uncopied;
@@ -338,6 +416,8 @@ static void render_ui() {
             r.outS = (r.state == JobState::Done) ? human_size(j->out_size) : std::string("-");
             r.status = build_status(*j, r.state);
             r.removable = (r.state != JobState::Running);
+            r.used_hardware = j->used_hardware;
+            r.is_image = j->info.is_image;
             r.out_path = j->out_path;
             if (r.state == JobState::Running || r.state == JobState::Queued || r.state == JobState::Probing)
                 n_active++;
@@ -376,6 +456,12 @@ static void render_ui() {
             if (r.state == JobState::Running) {
                 ImGui::ProgressBar(r.progress, ImVec2(-FLT_MIN, 0), r.status.c_str());
             } else {
+                if (r.state == JobState::Done && !r.is_image) {
+                    ImVec4 bc = r.used_hardware ? ImVec4(0.40f, 0.80f, 0.95f, 1)   // GPU = blue
+                                                : ImVec4(0.70f, 0.70f, 0.75f, 1);  // CPU = grey
+                    ImGui::TextColored(bc, r.used_hardware ? "GPU" : "CPU");
+                    ImGui::SameLine();
+                }
                 ImVec4 col; bool colored = true;
                 if (r.state == JobState::Done)           col = ImVec4(0.40f, 0.85f, 0.40f, 1);
                 else if (r.state == JobState::Failed)     col = ImVec4(0.90f, 0.40f, 0.40f, 1);
@@ -628,6 +714,7 @@ int main(int, char**) {
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     clip::init();
+    load_settings();
     std::thread(intake_run).detach();
     std::thread([] { g_hw = detect_hw_caps(); g_hw_ready = true; }).detach();
 
@@ -696,6 +783,7 @@ int main(int, char**) {
 
     g_app_quit = true;
     g_cancel = true;
+    save_settings();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
