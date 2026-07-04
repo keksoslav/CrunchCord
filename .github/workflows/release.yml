@@ -1,0 +1,63 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Build (MinGW UCRT64, static)
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja
+          cmake --build build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "dist/CrunchCord"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item build/CrunchCord.exe $stage/
+          Copy-Item README.md, LICENSE $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath "CrunchCord-windows-x64.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrunchCord-windows-x64
+          path: CrunchCord-windows-x64.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CrunchCord-windows-x64.zip
+          body: |
+            CrunchCord for Windows (x64), statically linked and standalone.
+
+            Setup:
+            1. Unzip anywhere.
+            2. Install FFmpeg so `ffmpeg.exe` and `ffprobe.exe` are on your PATH
+               (`winget install Gyan.FFmpeg`), or drop those two files next to
+               `CrunchCord.exe`.
+            3. Run `CrunchCord.exe`.
