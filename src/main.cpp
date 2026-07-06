@@ -25,6 +25,7 @@
 #include "process.h"
 #include "dialogs.h"
 #include "clipboard.h"
+#include "ffmpeg_setup.h"
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -59,6 +60,14 @@ static std::atomic<bool> g_app_quit{false};
 static HWND              g_hwnd = nullptr;
 static std::atomic<bool> g_hw_ready{false};
 static HwCaps            g_hw;
+
+// FFmpeg first-run setup state.
+static std::atomic<bool>  g_ffmpeg_ok{true};
+static std::atomic<bool>  g_ff_installing{false};
+static std::atomic<float> g_ff_progress{0.f};
+static std::atomic<bool>  g_ff_cancel{false};
+static std::string        g_ff_stage;  // guarded by g_ui_mtx
+static std::string        g_ff_error;  // guarded by g_ui_mtx
 
 // ---------------------------------------------------------------------------
 // Persisted settings (remembered between launches)
@@ -295,6 +304,23 @@ static void render_ui() {
     ImGui::TextDisabled("- shrink images & videos to fit Discord's upload limit");
     ImGui::Separator();
 
+    // ---- FFmpeg setup banner (until FFmpeg is available) ----
+    bool start_ff_install = false;
+    if (!g_ffmpeg_ok.load()) {
+        ImGui::TextColored(ImVec4(0.90f, 0.75f, 0.30f, 1), "FFmpeg is required and was not found.");
+        if (g_ff_installing.load()) {
+            std::string stage; { std::lock_guard<std::mutex> lk(g_ui_mtx); stage = g_ff_stage; }
+            ImGui::ProgressBar(g_ff_progress.load(), ImVec2(-FLT_MIN, 0), stage.c_str());
+        } else {
+            if (ImGui::Button("Download FFmpeg (about 160 MB)")) start_ff_install = true;
+            ImGui::SameLine();
+            ImGui::TextDisabled("or install it yourself:  winget install Gyan.FFmpeg");
+            std::string err; { std::lock_guard<std::mutex> lk(g_ui_mtx); err = g_ff_error; }
+            if (!err.empty()) ImGui::TextColored(ImVec4(0.90f, 0.40f, 0.40f, 1), "%s", err.c_str());
+        }
+        ImGui::Separator();
+    }
+
     // ---- target size ----
     const char* targets[] = {"Discord Free  -  10 MB", "Nitro Basic  -  50 MB",
                              "Nitro  -  500 MB", "Custom..."};
@@ -379,7 +405,7 @@ static void render_ui() {
       for (auto& j : g_jobs) if (j->state.load() == JobState::Queued) queued++; }
 
     bool start_clicked = false, cancel_clicked = false, clear_done = false, clear_all = false;
-    ImGui::BeginDisabled(running || queued == 0);
+    ImGui::BeginDisabled(running || queued == 0 || !g_ffmpeg_ok.load());
     if (ImGui::Button("Start", ImVec2(120, 0))) start_clicked = true;
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -557,6 +583,26 @@ static void render_ui() {
     }
     if (cancel_clicked) g_cancel = true;
 
+    if (start_ff_install && !g_ff_installing.load()) {
+        g_ff_installing = true;
+        g_ff_cancel = false;
+        { std::lock_guard<std::mutex> lk(g_ui_mtx); g_ff_error.clear(); }
+        std::thread([] {
+            std::string err = ffsetup::install([](const ffsetup::Progress& p) {
+                g_ff_progress = p.fraction;
+                std::lock_guard<std::mutex> lk(g_ui_mtx); g_ff_stage = p.stage;
+            }, g_ff_cancel);
+            if (err.empty()) {
+                g_ffmpeg_ok = true;
+                g_hw = detect_hw_caps(); // first encoder probe, now that FFmpeg exists
+                g_hw_ready = true;
+            } else {
+                std::lock_guard<std::mutex> lk(g_ui_mtx); g_ff_error = err;
+            }
+            g_ff_installing = false;
+        }).detach();
+    }
+
     if (!to_remove.empty() || clear_done || clear_all) {
         std::lock_guard<std::mutex> lk(g_ui_mtx);
         g_jobs.erase(std::remove_if(g_jobs.begin(), g_jobs.end(),
@@ -716,7 +762,12 @@ int main(int, char**) {
     clip::init();
     load_settings();
     std::thread(intake_run).detach();
-    std::thread([] { g_hw = detect_hw_caps(); g_hw_ready = true; }).detach();
+    std::thread([] {
+        bool ok = ffsetup::present();
+        g_ffmpeg_ok = ok;
+        if (ok) g_hw = detect_hw_caps(); // only probe encoders once FFmpeg exists
+        g_hw_ready = true;
+    }).detach();
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
                        GetModuleHandle(nullptr), nullptr, ::LoadCursor(nullptr, IDC_ARROW),
@@ -783,6 +834,7 @@ int main(int, char**) {
 
     g_app_quit = true;
     g_cancel = true;
+    g_ff_cancel = true;
     save_settings();
 
     ImGui_ImplDX11_Shutdown();
