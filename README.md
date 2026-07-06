@@ -57,8 +57,11 @@ driver and it will switch to the GPU on the next run.
 ## Requirements
 
 - Windows 10/11 (x64)
-- **FFmpeg**: `ffmpeg.exe` and `ffprobe.exe` on your `PATH`, or copied next to
-  `CrunchCord.exe`. Install with `winget install Gyan.FFmpeg`.
+- **FFmpeg**. If it is not already on your `PATH` (or next to `CrunchCord.exe`),
+  the app offers to download an official build for you on first run. You can also
+  install it yourself with `winget install Gyan.FFmpeg`. CrunchCord does not
+  redistribute FFmpeg; the download comes straight from the official source. See
+  [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
 - Optional: an NVIDIA GPU with driver 570+ for hardware encoding.
 
 ## Build
