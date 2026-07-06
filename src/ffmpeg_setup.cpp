@@ -49,28 +49,35 @@ static std::string first_sha256(const std::string& text) {
     return "";
 }
 
+// Returns the lowercase hex SHA-256 of a file, or "" on any failure (a safe
+// value: it can never match a real published checksum, so a failure aborts).
 static std::string sha256_file(const std::wstring& path) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return "";
-    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE h = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    DWORD objLen = 0, cb = 0;
-    BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0);
-    std::vector<UCHAR> obj(objLen);
-    BCryptCreateHash(alg, &h, obj.data(), objLen, nullptr, 0, 0);
-    std::vector<char> buf(1 << 20);
-    DWORD n = 0;
-    while (ReadFile(f, buf.data(), (DWORD)buf.size(), &n, nullptr) && n > 0)
-        BCryptHashData(h, (PUCHAR)buf.data(), n, 0);
-    CloseHandle(f);
-    UCHAR digest[32];
-    BCryptFinishHash(h, digest, 32, 0);
-    BCryptDestroyHash(h);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    static const char* hx = "0123456789abcdef";
     std::string out;
-    for (int i = 0; i < 32; ++i) { out += hx[digest[i] >> 4]; out += hx[digest[i] & 0xf]; }
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0) {
+        DWORD objLen = 0, cb = 0;
+        if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0) == 0) {
+            std::vector<UCHAR> obj(objLen);
+            BCRYPT_HASH_HANDLE h = nullptr;
+            if (BCryptCreateHash(alg, &h, obj.data(), objLen, nullptr, 0, 0) == 0) {
+                std::vector<char> buf(1 << 20);
+                DWORD n = 0; bool ok = true;
+                while (ReadFile(f, buf.data(), (DWORD)buf.size(), &n, nullptr) && n > 0)
+                    if (BCryptHashData(h, (PUCHAR)buf.data(), n, 0) != 0) { ok = false; break; }
+                UCHAR digest[32] = {0};
+                if (ok && BCryptFinishHash(h, digest, 32, 0) == 0) {
+                    static const char* hx = "0123456789abcdef";
+                    for (int i = 0; i < 32; ++i) { out += hx[digest[i] >> 4]; out += hx[digest[i] & 0xf]; }
+                }
+                BCryptDestroyHash(h);
+            }
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+    CloseHandle(f);
     return out;
 }
 
@@ -98,7 +105,8 @@ std::string install(const std::function<void(const Progress&)>& on_progress,
 
     // 1. Fetch the published checksum.
     report(0.02f, "Checking latest FFmpeg");
-    auto shaRes = proc::run_capture(L"curl.exe", std::wstring(L"-fsSL ") + kShaUrl);
+    auto shaRes = proc::run_capture(L"curl.exe",
+        std::wstring(L"-fsSL --proto =https --proto-redir =https ") + kShaUrl);
     if (!shaRes.launched) return "Could not run curl (requires Windows 10 1803 or newer).";
     if (shaRes.exit_code != 0) return "Could not reach the FFmpeg download server.";
     std::string published = first_sha256(shaRes.output);
@@ -106,7 +114,8 @@ std::string install(const std::function<void(const Progress&)>& on_progress,
 
     // 2. Download the archive with progress.
     if (cancel.load()) return "Cancelled.";
-    std::wstring dlArgs = L"-fL --progress-bar -o \"" + arc + L"\" " + kZipUrl;
+    std::wstring dlArgs = L"-fL --proto =https --proto-redir =https --progress-bar -o \""
+                          + arc + L"\" " + kZipUrl;
     int rc = proc::run_streaming(L"curl.exe", dlArgs,
         [&](const std::string& ln) {
             float p; if (parse_percent(ln, p)) report(0.05f + (p / 100.f) * 0.85f, "Downloading FFmpeg (about 160 MB)");
@@ -122,23 +131,25 @@ std::string install(const std::function<void(const Progress&)>& on_progress,
         return "Checksum mismatch. The download may be corrupted; please try again.";
     }
 
-    // 4. Extract ffmpeg.exe + ffprobe.exe (flattened) next to our exe.
+    // 4. Extract into the temp dir (contained), then copy only the two exes
+    //    into place. tmp has no trailing backslash, so the -C quoting is safe.
     report(0.96f, "Installing");
-    // Strip the trailing backslash: a quoted path ending in \" is misparsed as
-    // an escaped quote by the command-line splitter.
-    std::wstring destArg = dest;
-    while (!destArg.empty() && (destArg.back() == L'\\' || destArg.back() == L'/'))
-        destArg.pop_back();
-    std::wstring exArgs = L"-xf \"" + arc + L"\" -C \"" + destArg +
+    std::wstring exArgs = L"-xf \"" + arc + L"\" -C \"" + tmp +
                           L"\" --strip-components=2 \"*/bin/ffmpeg.exe\" \"*/bin/ffprobe.exe\"";
     auto exRes = proc::run_capture(L"tar.exe", exArgs);
-    DeleteFileW(arc.c_str());
-    RemoveDirectoryW(tmp.c_str());
-    if (!exRes.launched || exRes.exit_code != 0)
-        return "Could not extract the download.";
+    std::wstring tmpFf = tmp + L"\\ffmpeg.exe";
+    std::wstring tmpFp = tmp + L"\\ffprobe.exe";
+    bool ok = exRes.launched && exRes.exit_code == 0 &&
+              file_exists(tmpFf) && file_exists(tmpFp) &&
+              CopyFileW(tmpFf.c_str(), (dest + L"ffmpeg.exe").c_str(), FALSE) &&
+              CopyFileW(tmpFp.c_str(), (dest + L"ffprobe.exe").c_str(), FALSE);
 
-    if (!file_exists(dest + L"ffmpeg.exe") || !file_exists(dest + L"ffprobe.exe"))
-        return "Extraction finished but ffmpeg was not found.";
+    DeleteFileW(arc.c_str());
+    DeleteFileW(tmpFf.c_str());
+    DeleteFileW(tmpFp.c_str());
+    RemoveDirectoryW(tmp.c_str());
+
+    if (!ok) return "Could not install the download (is the app folder writable?).";
 
     report(1.0f, "Done");
     return "";
